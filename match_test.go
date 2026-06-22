@@ -44,7 +44,7 @@ func TestTemplate_Match(t *testing.T) {
 		match := tmpl.Match(c.expected)
 		if match == nil {
 			t.Errorf("%d: failed to match %q against %q", i, c.raw, c.expected)
-			t.Log(tmpl.prog.String())
+			t.Logf("template: %q", tmpl.Raw())
 			continue
 		}
 

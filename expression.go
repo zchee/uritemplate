@@ -13,14 +13,14 @@ import (
 )
 
 type template interface {
-	expand(*strings.Builder, Values) error
+	expand(*acc, Values) error
 	regexp(*strings.Builder)
 }
 
 type literals string
 
-func (l literals) expand(b *strings.Builder, _ Values) error {
-	b.WriteString(string(l))
+func (l literals) expand(b *acc, _ Values) error {
+	b.writeString(string(l))
 	return nil
 }
 
@@ -37,65 +37,66 @@ type varspec struct {
 }
 
 type expression struct {
-	vars   []varspec
-	op     parseOp
-	first  string
-	sep    string
-	named  bool
-	ifemp  string
-	escape escapeFunc
-	allow  runeClass
+	vars  []varspec
+	op    parseOp
+	first string
+	sep   string
+	named bool
+	ifemp string
+	allow runeClass
 }
 
 func (e *expression) init() {
 	switch e.op {
 	case parseOpSimple:
 		e.sep = ","
-		e.escape = escapeExceptU
 		e.allow = runeClassU
 	case parseOpPlus:
 		e.sep = ","
-		e.escape = escapeExceptUR
 		e.allow = runeClassUR
 	case parseOpCrosshatch:
 		e.first = "#"
 		e.sep = ","
-		e.escape = escapeExceptUR
 		e.allow = runeClassUR
 	case parseOpDot:
 		e.first = "."
 		e.sep = "."
-		e.escape = escapeExceptU
 		e.allow = runeClassU
 	case parseOpSlash:
 		e.first = "/"
 		e.sep = "/"
-		e.escape = escapeExceptU
 		e.allow = runeClassU
 	case parseOpSemicolon:
 		e.first = ";"
 		e.sep = ";"
 		e.named = true
-		e.escape = escapeExceptU
 		e.allow = runeClassU
 	case parseOpQuestion:
 		e.first = "?"
 		e.sep = "&"
 		e.named = true
 		e.ifemp = "="
-		e.escape = escapeExceptU
 		e.allow = runeClassU
 	case parseOpAmpersand:
 		e.first = "&"
 		e.sep = "&"
 		e.named = true
 		e.ifemp = "="
-		e.escape = escapeExceptU
 		e.allow = runeClassU
 	}
 }
 
-func (e *expression) expand(w *strings.Builder, values Values) error {
+// escapeValue percent-encodes v into w according to this expression's allowed
+// character class. Dispatch is static (a method, not a function-pointer field),
+// which lets escape analysis keep the Expand accumulator on the stack.
+func (e *expression) escapeValue(w *acc, v string) error {
+	if e.allow&runeClassR == runeClassR {
+		return escapeExceptUR(w, v)
+	}
+	return escapeExceptU(w, v)
+}
+
+func (e *expression) expand(w *acc, values Values) error {
 	first := true
 	for _, varspec := range e.vars {
 		value := values.Get(varspec.name)
@@ -104,10 +105,10 @@ func (e *expression) expand(w *strings.Builder, values Values) error {
 		}
 
 		if first {
-			w.WriteString(e.first)
+			w.writeString(e.first)
 			first = false
 		} else {
-			w.WriteString(e.sep)
+			w.writeString(e.sep)
 		}
 
 		if err := value.expand(w, varspec, e); err != nil {

@@ -7,9 +7,9 @@
 package uritemplate
 
 import (
-	"strings"
 	"unicode"
 	"unicode/utf8"
+	"unsafe"
 )
 
 var (
@@ -49,48 +49,33 @@ var (
 	reUnreserved = `\x2d\x2e\x30-\x39\x41-\x5a\x5f\x61-\x7a\x7e`
 )
 
+// tblUnreserved and tblUnreservedReserved are O(1) ASCII membership tables for
+// the unreserved and unreserved+reserved character sets. They are exact (not an
+// approximation) because rangeUnreserved and rangeReserved contain only ASCII
+// code points, so any byte >= utf8.RuneSelf is necessarily outside both sets and
+// is percent-encoded. They are derived from the authoritative RangeTables at
+// init so the two representations can never drift.
+var (
+	tblUnreserved         = asciiTable(rangeUnreserved)
+	tblUnreservedReserved = asciiTable(rangeUnreserved, rangeReserved)
+)
+
+func asciiTable(tables ...*unicode.RangeTable) [128]bool {
+	var t [128]bool
+	for c := range rune(128) {
+		t[c] = unicode.In(c, tables...)
+	}
+	return t
+}
+
 type runeClass uint8
 
 const (
 	runeClassU runeClass = 1 << iota
 	runeClassR
-	runeClassPctE
-	runeClassLast
 
 	runeClassUR = runeClassU | runeClassR
 )
-
-var runeClassNames = []string{
-	"U",
-	"R",
-	"pct-encoded",
-}
-
-func (rc runeClass) String() string {
-	ret := make([]string, 0, len(runeClassNames))
-	for i, j := 0, runeClass(1); j < runeClassLast; j <<= 1 {
-		if rc&j == j {
-			ret = append(ret, runeClassNames[i])
-		}
-		i++
-	}
-	return strings.Join(ret, "+")
-}
-
-func pctEncode(w *strings.Builder, r rune) {
-	if s := r >> 24 & 0xff; s > 0 {
-		w.Write([]byte{'%', hex[s/16], hex[s%16]})
-	}
-	if s := r >> 16 & 0xff; s > 0 {
-		w.Write([]byte{'%', hex[s/16], hex[s%16]})
-	}
-	if s := r >> 8 & 0xff; s > 0 {
-		w.Write([]byte{'%', hex[s/16], hex[s%16]})
-	}
-	if s := r & 0xff; s > 0 {
-		w.Write([]byte{'%', hex[s/16], hex[s%16]})
-	}
-}
 
 func unhex(c byte) byte {
 	switch {
@@ -146,43 +131,56 @@ func pctDecode(s string) string {
 			j++
 		}
 	}
-	return string(buf)
-}
-
-type escapeFunc func(*strings.Builder, string) error
-
-func escapeLiteral(w *strings.Builder, v string) error {
-	w.WriteString(v)
-	return nil
-}
-
-func escapeExceptU(w *strings.Builder, v string) error {
-	for i := 0; i < len(v); {
-		r, size := utf8.DecodeRuneInString(v[i:])
-		if r == utf8.RuneError {
-			return errorf(i, "invalid encoding")
-		}
-		if unicode.Is(rangeUnreserved, r) {
-			w.WriteRune(r)
-		} else {
-			pctEncode(w, r)
-		}
-		i += size
+	if len(buf) == 0 {
+		return ""
 	}
+	// buf is freshly allocated above, fully written, never mutated afterward and
+	// never pooled, so it is safe to alias as a string without copying.
+	return unsafe.String(unsafe.SliceData(buf), len(buf))
+}
+
+func escapeLiteral(w *acc, v string) error {
+	w.writeString(v)
 	return nil
 }
 
-func escapeExceptUR(w *strings.Builder, v string) error {
+func escapeExceptU(w *acc, v string) error {
+	return escape(w, v, &tblUnreserved)
+}
+
+func escapeExceptUR(w *acc, v string) error {
+	// TODO(yosida95): is pct-encoded triplets allowed here?
+	return escape(w, v, &tblUnreservedReserved)
+}
+
+// escape writes v to w, percent-encoding every byte that is not allowed by tbl.
+// Allowed bytes (an ASCII subset) are written verbatim; every other byte —
+// including each byte of a multi-byte UTF-8 sequence — is emitted as "%XX",
+// which yields correct UTF-8 percent-encoding per RFC 6570. It returns an error
+// if v contains an invalid UTF-8 sequence.
+func escape(w *acc, v string, tbl *[128]bool) error {
 	for i := 0; i < len(v); {
-		r, size := utf8.DecodeRuneInString(v[i:])
-		if r == utf8.RuneError {
+		if c := v[i]; c < utf8.RuneSelf {
+			if tbl[c] {
+				w.writeByte(c)
+			} else {
+				w.writeByte('%')
+				w.writeByte(hex[c>>4])
+				w.writeByte(hex[c&0x0f])
+			}
+			i++
+			continue
+		}
+		_, size := utf8.DecodeRuneInString(v[i:])
+		if size == 1 {
+			// utf8.RuneError with width 1 means an invalid encoding.
 			return errorf(i, "invalid encoding")
 		}
-		// TODO(yosida95): is pct-encoded triplets allowed here?
-		if unicode.In(r, rangeUnreserved, rangeReserved) {
-			w.WriteRune(r)
-		} else {
-			pctEncode(w, r)
+		for j := range size {
+			b := v[i+j]
+			w.writeByte('%')
+			w.writeByte(hex[b>>4])
+			w.writeByte(hex[b&0x0f])
 		}
 		i += size
 	}

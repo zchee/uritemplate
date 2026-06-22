@@ -7,23 +7,10 @@
 package uritemplate
 
 import (
-	"log"
 	"regexp"
 	"strings"
 	"sync"
 )
-
-var (
-	debug = debugT(false)
-)
-
-type debugT bool
-
-func (t debugT) Printf(format string, v ...interface{}) {
-	if t {
-		log.Printf(format, v...)
-	}
-}
 
 // Template represents a URI Template.
 type Template struct {
@@ -86,14 +73,45 @@ func (t *Template) Varnames() []string {
 
 // Expand returns a URI reference corresponding to the template expanded using the passed variables.
 func (t *Template) Expand(vars Values) (string, error) {
-	var w strings.Builder
+	w := acc{b: make([]byte, 0, t.expandSize(vars))}
 	for i := range t.exprs {
-		expr := t.exprs[i]
-		if err := expr.expand(&w, vars); err != nil {
+		var err error
+		switch expr := t.exprs[i].(type) {
+		case literals:
+			err = expr.expand(&w, vars)
+		case *expression:
+			err = expr.expand(&w, vars)
+		}
+		if err != nil {
 			return w.String(), err
 		}
 	}
 	return w.String(), nil
+}
+
+// expandSize estimates the byte length of Expand's output so the strings.Builder
+// can be sized once instead of growing incrementally. It is a heuristic: literal
+// runs contribute their exact length and each defined variable value contributes
+// its raw byte length (percent-encoding may expand it, but a low estimate only
+// costs a later regrowth, never correctness).
+func (t *Template) expandSize(vars Values) int {
+	n := len(t.raw)
+	for i := range t.exprs {
+		expr, ok := t.exprs[i].(*expression)
+		if !ok {
+			continue
+		}
+		for _, spec := range expr.vars {
+			v := vars.Get(spec.name)
+			if !v.Valid() {
+				continue
+			}
+			for _, s := range v.V {
+				n += len(s)
+			}
+		}
+	}
+	return n
 }
 
 // Regexp converts the template to regexp and returns compiled *regexp.Regexp.

@@ -6,8 +6,6 @@
 
 package uritemplate
 
-import "strings"
-
 // A varname containing pct-encoded characters is not the same variable as
 // a varname with those same characters decoded.
 //
@@ -86,7 +84,7 @@ func (v Value) Valid() bool {
 	}
 }
 
-func (v Value) expand(w *strings.Builder, spec varspec, exp *expression) error {
+func (v Value) expand(w *acc, spec varspec, exp *expression) error {
 	switch v.T {
 	case ValueTypeString:
 		val := v.V[0]
@@ -98,14 +96,14 @@ func (v Value) expand(w *strings.Builder, spec varspec, exp *expression) error {
 		}
 
 		if exp.named {
-			w.WriteString(spec.name)
+			w.writeString(spec.name)
 			if val == "" {
-				w.WriteString(exp.ifemp)
+				w.writeString(exp.ifemp)
 				return nil
 			}
-			w.WriteByte('=')
+			w.writeByte('=')
 		}
-		return exp.escape(w, val[:maxlen])
+		return exp.escapeValue(w, val[:maxlen])
 	case ValueTypeList:
 		var sep string
 		if spec.explode {
@@ -122,21 +120,21 @@ func (v Value) expand(w *strings.Builder, spec varspec, exp *expression) error {
 		}
 
 		if !spec.explode && exp.named {
-			w.WriteString(spec.name)
-			w.WriteByte('=')
+			w.writeString(spec.name)
+			w.writeByte('=')
 		}
 		for i := range v.V {
 			val := v.V[i]
 			if i > 0 {
-				w.WriteString(sep)
+				w.writeString(sep)
 			}
 			if val == "" {
-				w.WriteString(preifemp)
+				w.writeString(preifemp)
 				continue
 			}
-			w.WriteString(pre)
+			w.writeString(pre)
 
-			if err := exp.escape(w, val); err != nil {
+			if err := exp.escapeValue(w, val); err != nil {
 				return err
 			}
 		}
@@ -152,34 +150,37 @@ func (v Value) expand(w *strings.Builder, spec varspec, exp *expression) error {
 		}
 
 		var ifemp string
-		var kescape escapeFunc
+		var kLiteral bool
 		if spec.explode && exp.named {
 			ifemp = exp.ifemp
-			kescape = escapeLiteral
+			kLiteral = true
 		} else {
 			ifemp = ","
-			kescape = exp.escape
 		}
 
 		if !spec.explode && exp.named {
-			w.WriteString(spec.name)
-			w.WriteByte('=')
+			w.writeString(spec.name)
+			w.writeByte('=')
 		}
 
 		for i := 0; i < len(v.V); i += 2 {
 			if i > 0 {
-				w.WriteString(sep)
+				w.writeString(sep)
 			}
-			if err := kescape(w, v.V[i]); err != nil {
+			if kLiteral {
+				if err := escapeLiteral(w, v.V[i]); err != nil {
+					return err
+				}
+			} else if err := exp.escapeValue(w, v.V[i]); err != nil {
 				return err
 			}
 			if v.V[i+1] == "" {
-				w.WriteString(ifemp)
+				w.writeString(ifemp)
 				continue
 			}
-			w.WriteString(kvsep)
+			w.writeString(kvsep)
 
-			if err := exp.escape(w, v.V[i+1]); err != nil {
+			if err := exp.escapeValue(w, v.V[i+1]); err != nil {
 				return err
 			}
 		}
