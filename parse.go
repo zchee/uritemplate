@@ -80,7 +80,7 @@ type parser struct {
 	state parseState
 }
 
-func (p *parser) errorf(i rune, format string, a ...interface{}) error {
+func (p *parser) errorf(i rune, format string, a ...any) error {
 	return fmt.Errorf("%s: %s%s", fmt.Sprintf(format, a...), p.r[0:p.stop], string(i))
 }
 
@@ -231,7 +231,7 @@ func (p *parser) parseURITemplate() (*Template, error) {
 				}
 			}
 		case parseStatePrefix:
-			spec := &(exp.vars[len(exp.vars)-1])
+			spec := &exp.vars[len(exp.vars)-1]
 			switch {
 			case '0' <= r && r <= '9':
 				spec.maxlen *= 10

@@ -10,7 +10,7 @@ import (
 	"fmt"
 )
 
-func errorf(pos int, format string, a ...interface{}) error {
+func errorf(pos int, format string, a ...any) error {
 	msg := fmt.Sprintf(format, a...)
 	return fmt.Errorf("uritemplate:%d:%s", pos, msg)
 }

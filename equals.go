@@ -13,7 +13,7 @@ const (
 )
 
 // Equals reports whether or not two URI Templates t1 and t2 are equivalent.
-func Equals(t1 *Template, t2 *Template, flags CompareFlags) bool {
+func Equals(t1, t2 *Template, flags CompareFlags) bool {
 	if len(t1.exprs) != len(t2.exprs) {
 		return false
 	}
