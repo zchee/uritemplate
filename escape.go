@@ -153,24 +153,45 @@ func escapeExceptUR(w *acc, v string) error {
 	return escape(w, v, &tblUnreservedReserved)
 }
 
+// chunkCopyThreshold is the shortest allowed run that is worth flushing with a
+// single writeString (a memmove) rather than byte-by-byte. Below it the memmove
+// call overhead exceeds a handful of inlined byte appends, so short runs — the
+// common case for KV keys and small list members — keep the per-byte path.
+const chunkCopyThreshold = 8
+
 // escape writes v to w, percent-encoding every byte that is not allowed by tbl.
 // Allowed bytes (an ASCII subset) are written verbatim; every other byte —
 // including each byte of a multi-byte UTF-8 sequence — is emitted as "%XX",
 // which yields correct UTF-8 percent-encoding per RFC 6570. It returns an error
 // if v contains an invalid UTF-8 sequence.
+//
+// Allowed bytes are emitted in runs: the loop scans to the first byte that needs
+// encoding and copies the whole preceding run with one append, instead of one
+// append per byte. For values dominated by unreserved characters this turns a
+// per-byte write loop into a single memmove, the common case for paths,
+// hostnames, and identifiers. Runs shorter than chunkCopyThreshold fall back to
+// byte writes, where memmove setup would cost more than it saves.
 func escape(w *acc, v string, tbl *[128]bool) error {
+	start := 0
 	for i := 0; i < len(v); {
-		if c := v[i]; c < utf8.RuneSelf {
-			if tbl[c] {
-				w.writeByte(c)
-			} else {
-				w.writeByte('%')
-				w.writeByte(hex[c>>4])
-				w.writeByte(hex[c&0x0f])
-			}
+		c := v[i]
+		if c < utf8.RuneSelf && tbl[c] {
 			i++
 			continue
 		}
+
+		// Flush the allowed run accumulated since start before encoding c.
+		flushRun(w, v[start:i])
+
+		if c < utf8.RuneSelf {
+			w.writeByte('%')
+			w.writeByte(hex[c>>4])
+			w.writeByte(hex[c&0x0f])
+			i++
+			start = i
+			continue
+		}
+
 		_, size := utf8.DecodeRuneInString(v[i:])
 		if size == 1 {
 			// utf8.RuneError with width 1 means an invalid encoding.
@@ -183,6 +204,21 @@ func escape(w *acc, v string, tbl *[128]bool) error {
 			w.writeByte(hex[b&0x0f])
 		}
 		i += size
+		start = i
 	}
+	// Flush the trailing allowed run.
+	flushRun(w, v[start:])
 	return nil
+}
+
+// flushRun appends an allowed run to w, choosing a single memmove for long runs
+// and inlined byte writes for short ones (see chunkCopyThreshold).
+func flushRun(w *acc, run string) {
+	if len(run) >= chunkCopyThreshold {
+		w.writeString(run)
+		return
+	}
+	for i := 0; i < len(run); i++ {
+		w.writeByte(run[i])
+	}
 }
