@@ -8,6 +8,7 @@ package uritemplate
 
 import (
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -83,6 +84,52 @@ func TestTemplate_Match(t *testing.T) {
 				t.Errorf("%d: expected %#v, but got %#v", i, expected, actual)
 			}
 		}
+	}
+}
+
+func TestTemplateMatch_RouteFastPathCompatibility(t *testing.T) {
+	tmpl := MustNew("https://{host}/users{/user}{/media}")
+	got := tmpl.Match("https://example.com/users/kevin/pics")
+	if got == nil {
+		t.Fatal("Match returned nil")
+	}
+	for name, want := range map[string]string{
+		"host":  "example.com",
+		"user":  "kevin",
+		"media": "pics",
+	} {
+		if got.Get(name).String() != want {
+			t.Fatalf("capture %q = %q, want %q", name, got.Get(name).String(), want)
+		}
+	}
+}
+
+func TestTemplateMatch_RouteFastPathFallbackList(t *testing.T) {
+	tmpl := MustNew("{count}")
+	got := tmpl.Match("one,two,three")
+	if got == nil {
+		t.Fatal("Match returned nil")
+	}
+	want := []string{"one", "two", "three"}
+	if !reflect.DeepEqual(got.Get("count").List(), want) {
+		t.Fatalf("count = %#v, want %#v", got.Get("count").List(), want)
+	}
+}
+
+func TestTemplateMatch_ReturnedValueSlicesDoNotOverlapOnAppend(t *testing.T) {
+	tmpl := MustNew("https://{host}/users{/user}{/media}")
+	got := tmpl.Match("https://example.com/users/kevin/pics")
+	if got == nil {
+		t.Fatal("Match returned nil")
+	}
+
+	host := got.Get("host")
+	host.V = append(host.V, "mutated")
+	if got.Get("user").String() != "kevin" {
+		t.Fatalf("append to host value overlapped user capture: user=%#v", got.Get("user").V)
+	}
+	if got.Get("media").String() != "pics" {
+		t.Fatalf("append to host value overlapped media capture: media=%#v", got.Get("media").V)
 	}
 }
 

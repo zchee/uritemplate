@@ -46,14 +46,107 @@ import (
 // only when the keys are equal) share a capId so their segments merge into one
 // captured value, reproducing the map-keyed behavior of the original matcher.
 type prog struct {
-	segs []segMatcher
-	keys []string
+	segs  []segMatcher
+	keys  []string
+	route *routeProg
+
+	// ambiguous is set when the template can split a given input in more than one
+	// way, so the general scanner needs the failed-state memo to stay polynomial.
+	// Simple templates (each expression a single non-explode varspec, e.g.
+	// "{host}/{path}") are unambiguous: each segment consumes a determined span, so
+	// matchFrom never revisits a state and the memo would be pure overhead.
+	ambiguous bool
+}
+
+type routeProg struct {
+	parts []routePart
+}
+
+type routePart struct {
+	lit           string
+	first         string
+	capID         int
+	allowReserved bool
+	isVar         bool
 }
 
 type scanner struct {
 	input string
 	prog  *prog
-	caps  [][]int
+	caps  captureLists
+
+	// failed memoizes backtracking states already proven not to match, so an
+	// ambiguous template cannot re-explore the same state via different upstream
+	// splits. Both matcher recursions are pure functions of their state — no
+	// matcher branches on captured content, and captures are write-only scratch
+	// restored on every backtrack — so once a state fails it always fails. Caching
+	// that collapses the otherwise-exponential cross-product of greedy-shrink splits
+	// (within one expression's varspec list and across expressions, e.g.
+	// "{#x,0}" or "{a,b}{c,d}{e}" over a long joinable run) to polynomial time,
+	// closing a denial-of-service hazard without changing any match result.
+	//
+	// Keys are packed by failedKey; the map is allocated lazily and only for
+	// templates flagged ambiguous, so simple templates stay allocation-free.
+	failed map[uint64]bool
+}
+
+type captureLists struct {
+	lists []captureList
+}
+
+type captureList struct {
+	n      int
+	inline [2]int
+	extra  []int
+}
+
+func (c *captureLists) init(lists []captureList) {
+	c.lists = lists
+}
+
+func (c *captureLists) len(id int) int {
+	return c.lists[id].n
+}
+
+func (c *captureLists) append(id, start, end int) {
+	c.lists[id].append(start, end)
+}
+
+func (c *captureLists) truncate(id, n int) {
+	c.lists[id].truncate(n)
+}
+
+func (c *captureList) append(start, end int) {
+	if c.extra != nil {
+		c.extra = append(c.extra[:c.n], start, end)
+		c.n += 2
+		return
+	}
+	if c.n+2 <= len(c.inline) {
+		c.inline[c.n] = start
+		c.inline[c.n+1] = end
+		c.n += 2
+		return
+	}
+
+	c.extra = make([]int, c.n, max(8, c.n+2))
+	copy(c.extra, c.inline[:c.n])
+	c.extra = append(c.extra, start, end)
+	c.n += 2
+}
+
+func (c *captureList) truncate(n int) {
+	c.n = n
+	if c.extra != nil {
+		c.extra = c.extra[:n]
+	}
+}
+
+func (c *captureList) at(i int) int {
+	if c.extra != nil {
+		return c.extra[i]
+	}
+	return c.inline[i]
 }
 
 // segMatcher matches one top-level template segment (a literals run or an
@@ -67,6 +160,8 @@ type segMatcher func(s *scanner, pos, segIdx int) bool
 // on the Template and reused across Match calls.
 func buildProg(exprs []template) *prog {
 	p := &prog{segs: make([]segMatcher, 0, len(exprs))}
+	routeOK := true
+	routeParts := make([]routePart, 0, len(exprs))
 	keyID := map[string]int{}
 	intern := func(key string) int {
 		if id, ok := keyID[key]; ok {
@@ -80,21 +175,77 @@ func buildProg(exprs []template) *prog {
 	for i := range exprs {
 		switch e := exprs[i].(type) {
 		case literals:
-			p.segs = append(p.segs, literalMatcher(string(e)))
+			lit := string(e)
+			p.segs = append(p.segs, literalMatcher(lit))
+			if routeOK {
+				routeParts = append(routeParts, routePart{lit: lit})
+			}
 		case *expression:
 			p.segs = append(p.segs, expressionMatcher(e, intern))
+			// An expression introduces split ambiguity unless it is a single simple
+			// varspec with the unreserved value class: one non-explode, non-prefixed
+			// varspec whose value run admits only unreserved bytes (which exclude the
+			// separators, so the run divides exactly one way). Anything else —
+			// multiple varspecs, an explode loop, a prefix modifier, or the reserved
+			// value class (which admits "," and so lets a run divide many ways) —
+			// can blow up exponentially in the general scanner against an adversarial
+			// input, so it needs the failed-state memo. Note this is independent of
+			// route eligibility: the route fast path is non-backtracking, but it can
+			// defer to the general scanner, which must stay bounded on its own.
+			if !canRouteMatch(e) || e.allow&runeClassR == runeClassR {
+				p.ambiguous = true
+			}
+			if routeOK && canRouteMatch(e) {
+				spec := e.vars[0]
+				routeParts = append(routeParts, routePart{
+					first:         e.first,
+					capID:         intern(specKey(spec)),
+					allowReserved: e.allow&runeClassR == runeClassR,
+					isVar:         true,
+				})
+			} else {
+				routeOK = false
+			}
 		}
 	}
+	// Use the route fast path only for unambiguous templates. The route matcher is
+	// a separate recursive backtracker with no memoization, so for an ambiguous
+	// shape (e.g. several adjacent reserved single-vars like "{+a}{+b}{+c}{+d}")
+	// it would blow up to O(n^k) on adversarial input. Those templates fall through
+	// to the general scanner, whose failed-state memo keeps them polynomial; the
+	// route path stays for the simple unreserved-single-var case it was built for.
+	if routeOK && !p.ambiguous {
+		p.route = &routeProg{parts: routeParts}
+	}
 	return p
+}
+
+func canRouteMatch(e *expression) bool {
+	if e.named || len(e.vars) != 1 {
+		return false
+	}
+	spec := e.vars[0]
+	return !spec.explode && spec.maxlen == 0
 }
 
 // match runs the scanner over expansion using the pre-built segment matchers and
 // returns the captured variables, or nil if the template does not match.
 func match(p *prog, expansion string) Values {
+	if p.route != nil {
+		if out, ok := matchRoute(p.route, p.keys, expansion); ok {
+			return out
+		}
+	}
+
 	s := scanner{
 		input: expansion,
 		prog:  p,
-		caps:  make([][]int, len(p.keys)),
+	}
+	var inlineCaps [4]captureList
+	if len(p.keys) <= len(inlineCaps) {
+		s.caps.init(inlineCaps[:len(p.keys)])
+	} else {
+		s.caps.init(make([]captureList, len(p.keys)))
 	}
 
 	// The whole template matches only if every segment matches AND the final
@@ -103,21 +254,153 @@ func match(p *prog, expansion string) Values {
 		return nil
 	}
 
-	out := make(Values, len(p.keys))
-	for id, idx := range s.caps {
-		if len(idx) == 0 {
+	return materializeMatch(p.keys, &s.caps, expansion)
+}
+
+func materializeMatch(keys []string, caps *captureLists, input string) Values {
+	totalValues := 0
+	for i := range caps.lists {
+		totalValues += caps.lists[i].n / 2
+	}
+	values := make([]string, totalValues)
+	valueOffset := 0
+
+	out := make(Values, len(keys))
+	for id := range caps.lists {
+		capList := &caps.lists[id]
+		if capList.n == 0 {
 			continue
 		}
-		v := Value{V: make([]string, len(idx)/2)}
+		n := capList.n / 2
+		v := Value{V: values[valueOffset : valueOffset+n : valueOffset+n]}
+		valueOffset += n
 		for i := range v.V {
-			v.V[i] = pctDecode(s.input[idx[2*i]:idx[2*i+1]])
+			v.V[i] = pctDecode(input[capList.at(2*i):capList.at(2*i+1)])
 		}
 		if len(v.V) == 1 {
 			v.T = ValueTypeString
 		} else {
 			v.T = ValueTypeList
 		}
-		out[p.keys[id]] = v
+		out[keys[id]] = v
+	}
+	return out
+}
+
+type routeStatus uint8
+
+const (
+	routeNo routeStatus = iota
+	routeYes
+	routeFallback
+)
+
+type routeCapture struct {
+	start int
+	end   int
+	set   bool
+}
+
+func matchRoute(p *routeProg, keys []string, input string) (Values, bool) {
+	var caps [4]routeCapture
+	if len(keys) > len(caps) {
+		return nil, false
+	}
+	switch matchRouteFrom(p, input, &caps, 0, 0) {
+	case routeYes:
+		return materializeRouteMatch(keys, &caps, input), true
+	case routeNo:
+		return nil, true
+	default:
+		return nil, false
+	}
+}
+
+func matchRouteFrom(p *routeProg, input string, caps *[4]routeCapture, partIdx, pos int) routeStatus {
+	if partIdx == len(p.parts) {
+		if pos == len(input) || (pos == 0 && !routeRuneFollows(input, 0)) {
+			return routeYes
+		}
+		return routeNo
+	}
+
+	part := p.parts[partIdx]
+	if !part.isVar {
+		end := pos + len(part.lit)
+		if end > len(input) || input[pos:end] != part.lit {
+			return routeNo
+		}
+		return matchRouteFrom(p, input, caps, partIdx+1, end)
+	}
+
+	if bodyPos, ok := consumeLiteral(input, pos, part.first); ok {
+		switch matchRouteValue(p, input, caps, part, bodyPos, partIdx+1) {
+		case routeYes:
+			return routeYes
+		case routeFallback:
+			return routeFallback
+		}
+	}
+	return matchRouteFrom(p, input, caps, partIdx+1, pos)
+}
+
+func matchRouteValue(p *routeProg, input string, caps *[4]routeCapture, part routePart, start, nextPart int) routeStatus {
+	var buf [64]int
+	ends := valueEnds(buf[:0], input, start, part.allowReserved, 0)
+	saved := caps[part.capID]
+
+	for j := len(ends) - 1; j >= 0; j-- {
+		end := ends[j]
+		caps[part.capID] = routeCapture{start: start, end: end, set: true}
+
+		switch matchRouteFrom(p, input, caps, nextPart, end) {
+		case routeYes:
+			return routeYes
+		case routeFallback:
+			caps[part.capID] = saved
+			return routeFallback
+		}
+		if _, ok := consumeLiteral(input, end, ","); ok {
+			caps[part.capID] = saved
+			return routeFallback
+		}
+	}
+
+	caps[part.capID] = saved
+	return routeNo
+}
+
+func routeRuneFollows(input string, pos int) bool {
+	if pos >= len(input) {
+		return false
+	}
+	_, size := utf8.DecodeRuneInString(input[pos:])
+	return pos+size < len(input)
+}
+
+func materializeRouteMatch(keys []string, caps *[4]routeCapture, input string) Values {
+	totalValues := 0
+	for i := range keys {
+		if caps[i].set {
+			totalValues++
+		}
+	}
+	values := make([]string, totalValues)
+	valueOffset := 0
+
+	out := make(Values, len(keys))
+	for id, key := range keys {
+		cap := caps[id]
+		if !cap.set {
+			continue
+		}
+		values[valueOffset] = pctDecode(input[cap.start:cap.end])
+		v := Value{
+			T: ValueTypeString,
+			V: values[valueOffset : valueOffset+1 : valueOffset+1],
+		}
+		valueOffset++
+		out[key] = v
 	}
 	return out
 }
@@ -133,7 +416,55 @@ func (s *scanner) matchFrom(segIdx, pos int) bool {
 	if segIdx == len(s.prog.segs) {
 		return pos == len(s.input) || (pos == 0 && !s.runeFollows(0))
 	}
-	return s.prog.segs[segIdx](s, pos, segIdx)
+	// Unambiguous templates reach each state at most once, so the memo would only
+	// add overhead. Run them directly. Ambiguous templates memoize segment-entry
+	// failures to bound cross-expression backtracking.
+	if !s.prog.ambiguous {
+		return s.prog.segs[segIdx](s, pos, segIdx)
+	}
+	key := failedKey(segIdx, segmentEntryVarspecIdx, pos)
+	if s.failed[key] {
+		return false
+	}
+	if s.prog.segs[segIdx](s, pos, segIdx) {
+		return true
+	}
+	s.markFailed(key)
+	return false
+}
+
+// segmentEntryVarspecIdx is the varspec-index sentinel for a matchFrom
+// segment-entry state, distinct from any real varspec index (0..len-1) so a
+// segment-entry key never collides with a matchVarspecs key at the same
+// (segIdx, pos). A segment is entered at its raw pos, whereas matchVarspecs sees
+// pos after e.first is consumed, so the two are genuinely different states.
+const segmentEntryVarspecIdx = 0xffff
+
+// failedKey packs a backtracking state (segment index, varspec index within the
+// expression, byte position) into a single map key. The fields are small in
+// practice (a template has few segments and varspecs; pos fits in 32 bits for any
+// realistic input), so the packed key is collision-free.
+func failedKey(segIdx, varspecIdx, pos int) uint64 {
+	return uint64(segIdx)<<48 | uint64(varspecIdx)<<32 | uint64(uint32(pos))
+}
+
+// markFailed records that a state cannot match, allocating the memo on first use.
+func (s *scanner) markFailed(key uint64) {
+	if s.failed == nil {
+		s.failed = make(map[uint64]bool)
+	}
+	s.failed[key] = true
+}
+
+// loopMemo returns a per-position failed-set for a value-run loop, or nil for
+// unambiguous templates that cannot blow up and so need no memo. The returned
+// slice is scoped to one body-matcher call: each call's continuation differs, so
+// memos must not be shared across calls.
+func (s *scanner) loopMemo() []bool {
+	if !s.prog.ambiguous {
+		return nil
+	}
+	return make([]bool, len(s.input)+1)
 }
 
 // matchNext resumes matching at the segment following segIdx. Segment matchers
@@ -202,6 +533,20 @@ func matchVarspecs(s *scanner, e *expression, named bool, capIDs []int, segIdx, 
 	if i == len(e.vars) {
 		return s.matchNext(segIdx, pos)
 	}
+	// Memoize failed (segIdx, i, pos) states for ambiguous templates: a varspec
+	// list can divide a value run in exponentially many ways (e.g. "{#x,0}" over a
+	// long comma run), and the three alternatives below reach the same state via
+	// different upstream splits. matchVarspecs is a pure function of (segIdx, i,
+	// pos), so caching failures keeps the search polynomial. The real varspec index
+	// i (0..len-1) never collides with matchFrom's segmentEntryVarspecIdx sentinel.
+	var key uint64
+	if s.prog.ambiguous {
+		key = failedKey(segIdx, i, pos)
+		if s.failed[key] {
+			return false
+		}
+	}
+
 	spec := e.vars[i]
 	capID := capIDs[i]
 	cont := func(next int) bool {
@@ -225,7 +570,14 @@ func matchVarspecs(s *scanner, e *expression, named bool, capIDs []int, segIdx, 
 	}
 
 	// Alternative 3: this varspec (and its separator) contributes nothing.
-	return matchVarspecs(s, e, named, capIDs, segIdx, i+1, pos)
+	if matchVarspecs(s, e, named, capIDs, segIdx, i+1, pos) {
+		return true
+	}
+
+	if s.prog.ambiguous {
+		s.markFailed(key)
+	}
+	return false
 }
 
 // leadingSep returns the separator that precedes varspec i: e.sep for i>0,
@@ -264,8 +616,18 @@ func matchBareVar(s *scanner, e *expression, named bool, spec varspec, capID, po
 	if spec.explode {
 		joiner = e.sep
 	}
+	// The memo bounds the value-run loop. valueRun enumerates every candidate span
+	// end, and loop re-enters itself at those ends, so without memoization a
+	// reserved or exploded value over a long joinable run (e.g. "{+path}" against
+	// ",,,,,,...") re-explores the same position exponentially. loop(p) is a pure
+	// function of p for a fixed continuation k, so caching failed positions keeps
+	// it polynomial.
+	failed := s.loopMemo()
 	var loop func(p int) bool
 	loop = func(p int) bool {
+		if failed != nil && failed[p] {
+			return false
+		}
 		// Stop here first: yielding the rest of the input to what follows takes
 		// priority over consuming another segment.
 		if k(p) {
@@ -279,6 +641,9 @@ func matchBareVar(s *scanner, e *expression, named bool, spec varspec, capID, po
 			if valueRun(s, named, spec, capID, jp, loop, true) {
 				return true
 			}
+		}
+		if failed != nil {
+			failed[p] = true
 		}
 		return false
 	}
@@ -391,6 +756,7 @@ func valueRun(s *scanner, named bool, spec varspec, capID, start int, k func(int
 	// maxlen. ends[j] is the byte offset after consuming j units. A stack-local
 	// array holds the common short-value case so no heap allocation occurs; only
 	// values longer than len(buf) units fall back to a heap slice.
+	//
 	var buf [64]int
 	ends := valueEnds(buf[:0], s.input, start, named, spec.maxlen)
 
@@ -403,17 +769,18 @@ func valueRun(s *scanner, named bool, spec varspec, capID, start int, k func(int
 		}
 	}
 
-	saved := len(s.caps[capID])
+	saved := s.caps.len(capID)
 	// Greedy: try the longest span first, then shrink toward lo.
 	for j := len(ends) - 1; j >= lo; j-- {
 		end := ends[j]
-		s.caps[capID] = append(s.caps[capID][:saved], start, end)
+		s.caps.truncate(capID, saved)
+		s.caps.append(capID, start, end)
 		if k(end) {
 			return true
 		}
 	}
 	// Restore: no span worked, drop our appended segment(s).
-	s.caps[capID] = s.caps[capID][:saved]
+	s.caps.truncate(capID, saved)
 	return false
 }
 
