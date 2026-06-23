@@ -792,10 +792,7 @@ func valueRun(s *scanner, named bool, spec varspec, capID, start int, k func(int
 func valueEnds(dst []int, input string, start int, named bool, maxlen int) []int {
 	ends := append(dst, start)
 	pos := start
-	for {
-		if maxlen > 0 && len(ends)-1 >= maxlen {
-			break
-		}
+	for maxlen <= 0 || len(ends)-1 < maxlen {
 		n, ok := valueUnit(input, pos, named)
 		if !ok {
 			break

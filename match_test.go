@@ -79,7 +79,7 @@ func TestTemplate_Match(t *testing.T) {
 						break
 					}
 				}
-			} else if !(le == 0 && la == 1 && actual.V[0] == "") { // not undef
+			} else if le != 0 || la != 1 || actual.V[0] != "" { // not undef
 				t.Errorf("%d: failed to match %q against %q", i, c.raw, c.expected)
 				t.Errorf("%d: expected %#v, but got %#v", i, expected, actual)
 			}
