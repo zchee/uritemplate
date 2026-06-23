@@ -22,10 +22,11 @@ var (
 	_ func(...string) Value                         = List
 	_ func(...string) Value                         = KV
 
-	_ func(*Template) string                  = (*Template).Raw
-	_ func(*Template) []string                = (*Template).Varnames
-	_ func(*Template, Values) (string, error) = (*Template).Expand
-	_ func(*Template, string) Values          = (*Template).Match
+	_ func(*Template) string                          = (*Template).Raw
+	_ func(*Template) []string                        = (*Template).Varnames
+	_ func(*Template, Values) (string, error)         = (*Template).Expand
+	_ func(*Template, []byte, Values) ([]byte, error) = (*Template).AppendExpand
+	_ func(*Template, string) Values                  = (*Template).Match
 
 	_ func(Value) string   = Value.String
 	_ func(Value) []string = Value.List

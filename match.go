@@ -14,12 +14,12 @@ package uritemplate
 // inverts the expansion grammar directly. The per-template segment matchers are
 // built once and cached on the Template.
 func (tmpl *Template) Match(expansion string) Values {
-	tmpl.mu.Lock()
-	if tmpl.prog == nil {
+	// The match program is built at most once via progOnce and is immutable
+	// thereafter. After the first call this is an atomic done-flag check plus a
+	// lock-free read, so concurrent matches run fully in parallel with no mutex
+	// contention.
+	tmpl.progOnce.Do(func() {
 		tmpl.prog = buildProg(tmpl.exprs)
-	}
-	prog := tmpl.prog
-	tmpl.mu.Unlock()
-
-	return match(prog, expansion)
+	})
+	return match(tmpl.prog, expansion)
 }

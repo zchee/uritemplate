@@ -13,15 +13,25 @@ import (
 )
 
 // Template represents a URI Template.
+//
+// The derived forms — the match program, the variable-name list, and the regexp
+// — are each built at most once, lazily, on first use and published via a
+// sync.Once. After the first call every accessor is a lock-free read, so Match,
+// Varnames, and Regexp are safe for concurrent use with no mutex contention.
+// Building lazily keeps New cheap for templates that are parsed but, say, only
+// expanded and never matched.
 type Template struct {
 	raw   string
 	exprs []template
 
-	// protects the rest of fields
-	mu       sync.Mutex
-	varnames []string
-	re       *regexp.Regexp
+	progOnce sync.Once
 	prog     *prog
+
+	varnamesOnce sync.Once
+	varnames     []string
+
+	reOnce sync.Once
+	re     *regexp.Regexp
 }
 
 // New parses and constructs a new Template instance based on the template.
@@ -45,17 +55,24 @@ func (t *Template) Raw() string {
 }
 
 // Varnames returns variable names used in the template.
+//
+// The slice is computed at most once via varnamesOnce; after the first call this
+// is a lock-free read safe for concurrent callers. The returned slice is owned by
+// the Template; callers must not mutate it.
 func (t *Template) Varnames() []string {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.varnames != nil {
-		return t.varnames
-	}
+	t.varnamesOnce.Do(func() {
+		t.varnames = buildVarnames(t.exprs)
+	})
+	return t.varnames
+}
 
+// buildVarnames collects the distinct variable names across all expressions, in
+// first-seen order. It runs once during parsing so Varnames needs no lock.
+func buildVarnames(exprs []template) []string {
 	reg := map[string]struct{}{}
-	t.varnames = []string{}
-	for i := range t.exprs {
-		expr, ok := t.exprs[i].(*expression)
+	varnames := []string{}
+	for i := range exprs {
+		expr, ok := exprs[i].(*expression)
 		if !ok {
 			continue
 		}
@@ -64,29 +81,58 @@ func (t *Template) Varnames() []string {
 				continue
 			}
 			reg[spec.name] = struct{}{}
-			t.varnames = append(t.varnames, spec.name)
+			varnames = append(varnames, spec.name)
 		}
 	}
-
-	return t.varnames
+	return varnames
 }
 
 // Expand returns a URI reference corresponding to the template expanded using the passed variables.
 func (t *Template) Expand(vars Values) (string, error) {
 	w := acc{b: make([]byte, 0, t.expandSize(vars))}
+	err := t.expandInto(&w, vars)
+	return w.String(), err
+}
+
+// AppendExpand expands the template into dst and returns the extended buffer,
+// like the append built-in. When dst has enough capacity the expansion writes in
+// place with no allocation, so callers that reuse a buffer across many
+// expansions amortize away the per-call result allocation that Expand must make
+// to return a string.
+//
+// The returned slice may share dst's backing array; treat dst as consumed and
+// use only the returned slice afterward. On error the buffer still contains the
+// output produced before the error, mirroring Expand. A nil dst is valid and
+// behaves like appending to an empty buffer.
+func (t *Template) AppendExpand(dst []byte, vars Values) ([]byte, error) {
+	size := t.expandSize(vars)
+	if cap(dst)-len(dst) < size {
+		grown := make([]byte, len(dst), len(dst)+size)
+		copy(grown, dst)
+		dst = grown
+	}
+	w := acc{b: dst}
+	err := t.expandInto(&w, vars)
+	return w.b, err
+}
+
+// expandInto runs the expansion, writing the result through w. It is the shared
+// core of Expand and AppendExpand; the two differ only in how they source and
+// return the underlying buffer.
+func (t *Template) expandInto(w *acc, vars Values) error {
 	for i := range t.exprs {
 		var err error
 		switch expr := t.exprs[i].(type) {
 		case literals:
-			err = expr.expand(&w, vars)
+			err = expr.expand(w, vars)
 		case *expression:
-			err = expr.expand(&w, vars)
+			err = expr.expand(w, vars)
 		}
 		if err != nil {
-			return w.String(), err
+			return err
 		}
 	}
-	return w.String(), nil
+	return nil
 }
 
 // expandSize estimates the byte length of Expand's output so the strings.Builder
@@ -115,20 +161,18 @@ func (t *Template) expandSize(vars Values) int {
 }
 
 // Regexp converts the template to regexp and returns compiled *regexp.Regexp.
+//
+// Compilation is performed at most once, lazily, and published via reOnce; after
+// the first call this is a lock-free read of the cached *regexp.Regexp.
 func (t *Template) Regexp() *regexp.Regexp {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.re != nil {
-		return t.re
-	}
-
-	var b strings.Builder
-	b.WriteByte('^')
-	for _, expr := range t.exprs {
-		expr.regexp(&b)
-	}
-	b.WriteByte('$')
-	t.re = regexp.MustCompile(b.String())
-
+	t.reOnce.Do(func() {
+		var b strings.Builder
+		b.WriteByte('^')
+		for _, expr := range t.exprs {
+			expr.regexp(&b)
+		}
+		b.WriteByte('$')
+		t.re = regexp.MustCompile(b.String())
+	})
 	return t.re
 }
