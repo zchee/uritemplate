@@ -8,6 +8,7 @@ package uritemplate
 
 import (
 	"fmt"
+	"strings"
 	"unicode"
 	"unicode/utf8"
 )
@@ -71,7 +72,33 @@ var (
 		},
 		LatinOffset: 10,
 	}
+
+	// ASCII fast-path tables for the per-rune validation hot path. Template text
+	// is overwhelmingly ASCII, so a 128-entry lookup avoids the binary search
+	// unicode.Is performs over the range tables above. Non-ASCII runes still fall
+	// back to unicode.Is. TestParserASCIITablesMatchRangeTables proves these stay
+	// in lockstep with the range tables.
+	tblVarchar  = asciiTable(rangeVarchar)
+	tblLiterals = asciiTable(rangeLiterals)
 )
+
+// isVarchar reports whether r is allowed in a variable name, using the ASCII
+// fast path for r < utf8.RuneSelf and unicode.Is otherwise.
+func isVarchar(r rune) bool {
+	if r < utf8.RuneSelf {
+		return tblVarchar[r]
+	}
+	return unicode.Is(rangeVarchar, r)
+}
+
+// isLiteral reports whether r is allowed as literal text, using the ASCII fast
+// path for r < utf8.RuneSelf and unicode.Is otherwise.
+func isLiteral(r rune) bool {
+	if r < utf8.RuneSelf {
+		return tblLiterals[r]
+	}
+	return unicode.Is(rangeLiterals, r)
+}
 
 type parser struct {
 	r     string
@@ -112,9 +139,14 @@ func (p *parser) setState(state parseState) {
 }
 
 func (p *parser) parseURITemplate() (*Template, error) {
+	// Pre-size exprs so parsing never regrows the slice. exprs interleaves literal
+	// runs and expressions; with n expressions (one per '{') there are at most n+1
+	// literal runs around them, so 2n+1 is the exact upper bound on element count.
+	// Counting '{' is cheap and ASCII-safe ('{' is single-byte in UTF-8 and never
+	// appears inside a multi-byte rune).
 	tmpl := Template{
 		raw:   p.r,
-		exprs: []template{},
+		exprs: make([]template, 0, 2*strings.Count(p.r, "{")+1),
 	}
 
 	var exp *expression
@@ -149,7 +181,7 @@ func (p *parser) parseURITemplate() (*Template, error) {
 					return nil, err
 				}
 			default:
-				if !unicode.Is(rangeLiterals, r) {
+				if !isLiteral(r) {
 					p.unread(r)
 					return nil, p.errorf('_', "unacceptable character (hint: use %%XX encoding)")
 				}
@@ -225,7 +257,7 @@ func (p *parser) parseURITemplate() (*Template, error) {
 					return nil, p.errorf('|', "unacceptable variable name")
 				}
 			default:
-				if !unicode.Is(rangeVarchar, r) {
+				if !isVarchar(r) {
 					p.unread(r)
 					return nil, p.errorf('_', "unacceptable variable name")
 				}
