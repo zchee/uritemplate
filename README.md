@@ -11,6 +11,16 @@ full functionality of URI Template Level 4.
 `uritemplate` can also generate a regexp that matches expansion of the
 URI Template from a URI Template.
 
+This module is a performance-focused fork of
+[`yosida95/uritemplate`](https://github.com/yosida95/uritemplate). The exported
+API is unchanged — it is a compile-time-guarded drop-in replacement (see
+[`api_compat_test.go`](./api_compat_test.go)) — but the internals were rewritten
+for speed: the Pike-VM matcher was replaced with a bespoke backtracking scanner
+and the expansion path is byte-oriented. The result is a large speedup, most
+dramatically for `Match`. See [Performance](#performance) for measured numbers
+and [Drop-in replacement](#drop-in-replacement) for how to switch an existing
+project over without changing any code.
+
 ## Performance
 
 This `v4` line replaces the original Pike-VM matcher with a bespoke
@@ -71,6 +81,37 @@ this row come from the larger templates that dominate real workloads.
 ```shell
 go get github.com/zchee/uritemplate/v4@latest
 ```
+
+## Drop-in replacement
+
+Because the exported API is identical to
+[`yosida95/uritemplate`](https://github.com/yosida95/uritemplate), an existing
+project can adopt this fork **without changing any import paths or code** by
+adding a `replace` directive to its `go.mod`. Run these from your module root:
+
+```shell
+go mod edit -replace github.com/yosida95/uritemplate/v3=github.com/zchee/uritemplate/v4@latest
+go mod tidy
+go build ./...
+```
+
+This rewrites your `go.mod` to:
+
+```go.mod
+replace github.com/yosida95/uritemplate/v3 => github.com/zchee/uritemplate/v4 v4.x.y
+```
+
+where `go mod tidy` fills in the resolved version. Your code keeps importing
+`github.com/yosida95/uritemplate/v3`; the compiler resolves it to this fork. The
+API-compatibility guard in [`api_compat_test.go`](./api_compat_test.go) makes
+"drop-in" a compile-time property, not a hope: every exported function, method,
+type, and constant keeps its original signature.
+
+> One behavioral difference is intentional: this fork fixes a percent-encoding
+> bug so non-ASCII bytes are UTF-8 encoded per RFC 3986 (`é` expands to
+> `%C3%A9`, where `v3` emitted the invalid `%E9`). This changes the wire output
+> for templates that expand non-ASCII values. It is almost always the behavior
+> you want, but verify if you depend on byte-exact compatibility with `v3`.
 
 ## Documentation
 
