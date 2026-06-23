@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - v4
+  pull_request:
+    branches:
+      - v4
+  workflow_dispatch:
+
+# Cancel superseded runs for the same ref to save runner minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-slim
+
+    permissions:
+      contents: read
+      id-token: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        go:
+          - "1.26"
+          - stable
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          check-latest: true
+
+      - name: Build
+        run: go build -v ./...
+
+      - name: Test
+        run: |
+          go test -v -race -count=1 -cover -covermode=atomic -coverpkg=./... -coverprofile=coverage.out -tags='osusergo,netgo,static' -ldflags='-s -w' ./...
+
+      - name: Upload coverage to Codecov
+        if: success()
+        uses: codecov/codecov-action@v6
+        with:
+          report_type: coverage
+          flags: ${{ runner.os }}-${{ runner.arch }}
+          use_oidc: true
+          verbose: true
+
+  vet:
+    runs-on: ubuntu-slim
+
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          check-latest: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "${unformatted}" ]; then
+            echo "::error::These files are not gofmt-formatted:"
+            echo "${unformatted}"
+            gofmt -d .
+            exit 1
+          fi
+
+      - name: go mod tidy
+        run: |
+          go mod tidy
+          if ! git diff --exit-code -- go.mod go.sum; then
+            echo "::error::go.mod/go.sum are not tidy; run 'go mod tidy' and commit."
+            exit 1
+          fi
+
+  fuzz:
+    runs-on: ubuntu-slim
+
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          check-latest: true
+
+      # `go test -fuzz` runs at most one matching target per package per
+      # invocation, so each target is fuzzed separately under a short time
+      # budget. Seed corpora come from f.Add(...) calls in the targets.
+      - name: Fuzz FuzzParseExpandMatch
+        run: go test -run='^$' -fuzz='^FuzzParseExpandMatch$' -fuzztime=30s ./...
+
+      - name: Fuzz FuzzMatchNoPanic
+        run: go test -run='^$' -fuzz='^FuzzMatchNoPanic$' -fuzztime=30s ./...
